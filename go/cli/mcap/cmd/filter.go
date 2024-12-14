@@ -128,30 +128,6 @@ func buildFilterOptions(flags *filterFlags) (*filterOpts, error) {
 }
 
 func run(filterOptions *filterOpts, args []string) {
-	var reader io.Reader
-	if len(args) == 0 {
-		stat, err := os.Stdin.Stat()
-		if err != nil {
-			die("failed to check stdin state: %s", err)
-		}
-		if stat.Mode()&os.ModeCharDevice == 0 {
-			reader = os.Stdin
-		} else {
-			die("please supply a file. see --help for usage details.")
-		}
-	} else {
-		newReader, _, err := utils.GetReader(context.Background(), args[0])
-		if err != nil {
-			die("failed to open source for reading: %s", err)
-		}
-		defer func() {
-			if closeErr := newReader.Close(); closeErr != nil {
-				die("error closing read source: %s", closeErr)
-			}
-		}()
-		reader = newReader
-	}
-
 	var writer io.Writer
 	if filterOptions.output == "" {
 		if !utils.StdoutRedirected() {
@@ -171,7 +147,50 @@ func run(filterOptions *filterOpts, args []string) {
 		writer = newWriter
 	}
 
-	err := filter(reader, writer, filterOptions)
+	mcapWriter, err := mcap.NewWriter(writer, &mcap.WriterOptions{
+		Compression: filterOptions.compressionFormat,
+		Chunked:     true,
+		ChunkSize:   filterOptions.chunkSize,
+	})
+
+	if err != nil {
+		die("failed to create mcap writer: %s", err)
+	}
+
+	if len(args) == 0 {
+		stat, err := os.Stdin.Stat()
+		if err != nil {
+			die("failed to check stdin state: %s", err)
+		}
+		if stat.Mode()&os.ModeCharDevice == 0 {
+			reader := os.Stdin
+			err = filter_with_reader(reader, mcapWriter, filterOptions)
+		} else {
+			die("please supply a file. see --help for usage details.")
+		}
+	} else {
+		reader, _, err := utils.GetReader(context.Background(), args[0])
+		if err != nil {
+			die("failed to open source for reading: %s", err)
+		}
+		defer func() {
+			if closeErr := reader.Close(); closeErr != nil {
+				die("error closing read source: %s", closeErr)
+			}
+		}()
+
+		if filterOptions.recover {
+			fmt.Println("filter_with_reader")
+			err = filter_with_reader(reader, mcapWriter, filterOptions)
+		} else {
+			fmt.Println("filter_with_readseeker")
+			err = filter_with_readseeker(reader, mcapWriter, filterOptions)
+			if err != nil {
+				die("failed to filter: %s", err)
+			}
+		}
+	}
+
 	if err != nil {
 		die("failed to filter: %s", err)
 	}
@@ -206,19 +225,112 @@ type markableChannel struct {
 	written bool
 }
 
-func filter(
-	r io.Reader,
-	w io.Writer,
+func should_channel_be_written(channel *mcap.Channel, filterOptions *filterOpts) bool {
+	// if any topics match an includeTopic, add it.
+	for i := range filterOptions.includeTopics {
+		matcher := filterOptions.includeTopics[i]
+		if matcher.MatchString(channel.Topic) {
+			return true
+		}
+	}
+	// if a topic does not match any excludeTopic, add it.
+	if len(filterOptions.excludeTopics) != 0 {
+		shouldInclude := true
+		for i := range filterOptions.excludeTopics {
+			matcher := filterOptions.excludeTopics[i]
+			if matcher.MatchString(channel.Topic) {
+				shouldInclude = false
+			}
+		}
+		if shouldInclude {
+			return true
+		}
+	}
+	// if neither exclude or include topics are specified, add all channels.
+	if len(filterOptions.includeTopics) == 0 && len(filterOptions.excludeTopics) == 0 {
+		return true
+	}
+	return false
+}
+
+func filter_with_readseeker(
+	r io.ReadSeeker,
+	mcapWriter *mcap.Writer,
 	opts *filterOpts,
 ) error {
-	mcapWriter, err := mcap.NewWriter(w, &mcap.WriterOptions{
-		Compression: opts.compressionFormat,
-		Chunked:     true,
-		ChunkSize:   opts.chunkSize,
-	})
+	defer func() {
+		err := mcapWriter.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "failed to close mcap writer: %w", err)
+			return
+		}
+	}()
+
+	mcapReader, err := mcap.NewReader(r)
 	if err != nil {
 		return err
 	}
+
+	mcapInfo, err := mcapReader.Info()
+	if err != nil {
+		return err
+	}
+
+	err = mcapWriter.WriteHeader(mcapInfo.Header)
+	if err != nil {
+		return err
+	}
+
+	var topics []string
+	for _, channel := range mcapInfo.Channels {
+		if should_channel_be_written(channel, opts) {
+			topics = append(topics, channel.Topic)
+
+			err = mcapWriter.WriteSchema(mcapInfo.Schemas[channel.SchemaID])
+			if err != nil {
+				return err
+			}
+
+			err = mcapWriter.WriteChannel(channel)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	messageIter, err := mcapReader.Messages(
+		mcap.AfterNanos(opts.start),
+		mcap.BeforeNanos(opts.end),
+		mcap.WithTopics(topics),
+		mcap.UsingIndex(true),
+	)
+	if err != nil {
+		return err
+	}
+
+	var msg mcap.Message
+	for {
+		_, _, msg, err := messageIter.NextInto(&msg)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return err
+		}
+		err = mcapWriter.WriteMessage(msg)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func filter_with_reader(
+	r io.Reader,
+	mcapWriter *mcap.Writer,
+	opts *filterOpts,
+) error {
 
 	var numMessages, numAttachments, numMetadata uint64
 
@@ -235,7 +347,7 @@ func filter(
 			if ar.LogTime >= opts.end {
 				return nil
 			}
-			err = mcapWriter.WriteAttachment(&mcap.Attachment{
+			err := mcapWriter.WriteAttachment(&mcap.Attachment{
 				LogTime:    ar.LogTime,
 				CreateTime: ar.CreateTime,
 				Name:       ar.Name,
@@ -316,28 +428,7 @@ func filter(
 			if err != nil {
 				return err
 			}
-			// if any topics match an includeTopic, add it.
-			for i := range opts.includeTopics {
-				matcher := opts.includeTopics[i]
-				if matcher.MatchString(channel.Topic) {
-					channels[channel.ID] = markableChannel{channel, false}
-				}
-			}
-			// if a topic does not match any excludeTopic, add it.
-			if len(opts.excludeTopics) != 0 {
-				shouldInclude := true
-				for i := range opts.excludeTopics {
-					matcher := opts.excludeTopics[i]
-					if matcher.MatchString(channel.Topic) {
-						shouldInclude = false
-					}
-				}
-				if shouldInclude {
-					channels[channel.ID] = markableChannel{channel, false}
-				}
-			}
-			// if neither exclude or include topics are specified, add all channels.
-			if len(opts.includeTopics) == 0 && len(opts.excludeTopics) == 0 {
+			if should_channel_be_written(channel, opts) {
 				channels[channel.ID] = markableChannel{channel, false}
 			}
 		case mcap.TokenMessage:

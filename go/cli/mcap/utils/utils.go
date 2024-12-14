@@ -6,12 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"regexp"
 	"time"
 
-	"github.com/jfbus/httprs"
 	"github.com/olekukonko/tablewriter"
 	"github.com/schollz/progressbar/v3"
 	"gocloud.dev/blob"
@@ -21,17 +19,17 @@ import (
 )
 
 var (
-	schemeRegex = regexp.MustCompile(`(?P<Scheme>\w+)://(?P<Path>.*)`)
-	bucketRegex = regexp.MustCompile(`(?P<Bucket>[a-z0-9_.-]+)/(?P<Filename>.*)`)
+	uriComponentsRegex = regexp.MustCompile(`(?P<Scheme>\w+)://(?P<Path>.*?)(?P<QueryParams>\?.*)?$`)
+	bucketRegex        = regexp.MustCompile(`(?P<Bucket>[a-z0-9_.-]+)/(?P<Filename>.*)`)
 )
 
-func GetSchemeFromUri(uri string) (scheme string, path string) {
-	match := schemeRegex.FindStringSubmatch(uri)
+func extractUriComponents(uri string) (scheme string, path string, queryParams string) {
+	match := uriComponentsRegex.FindStringSubmatch(uri)
 	if len(match) == 0 {
 		// Probably just a raw path
-		return "", uri
+		return "", uri, ""
 	}
-	return match[1], match[2]
+	return match[1], match[2], match[3]
 }
 
 func GetBucketFromPath(path string) (bucket string, filename string) {
@@ -58,23 +56,22 @@ func StdoutRedirected() bool {
 }
 
 func GetReader(ctx context.Context, uri string) (io.ReadSeekCloser, bool, error) {
-	scheme, path := GetSchemeFromUri(uri)
+	scheme, path, queryParams := extractUriComponents(uri)
 	switch scheme {
 	case "":
 		// Assume that a URI without a scheme is a local path
 		rs, err := os.Open(path)
 		return rs, false, err
 	case "http", "https":
-		resp, err := http.Get(uri)
+		rs, err := NewHTTPSeeker(uri, WithMinRequestSize(2<<20))
 		if err != nil {
 			return nil, true, err
 		}
-		rs := httprs.NewHttpReadSeeker(resp)
 		return rs, true, nil
 	default:
 		// Assume that any other scheme can be handled by Go CDK
 		bucket, filename := GetBucketFromPath(path)
-		bucketClient, err := blob.OpenBucket(ctx, fmt.Sprintf("%v://%v", scheme, bucket))
+		bucketClient, err := blob.OpenBucket(ctx, fmt.Sprintf("%v://%v%v", scheme, bucket, queryParams))
 		if err != nil {
 			return nil, true, err
 		}
